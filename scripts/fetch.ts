@@ -52,99 +52,68 @@ async function checkIssue(
   }
 }
 
-function extractRepoOwner(url: string | null): string | null {
-  if (!url) return null;
-  const m = url.match(/github\.com\/([^/]+)\//i);
-  return m ? m[1].toLowerCase() : null;
-}
-
-function toUsd(price: { value: number; unit: string } | null | undefined): number {
-  if (!price) return 0;
-  if (price.unit === "USD_CENT") return price.value / 100;
-  return price.value;
-}
-
-function toIso(ms: number | null | undefined): string | null {
-  if (!ms) return null;
-  return new Date(ms).toISOString();
-}
-
-async function main() {
+async function main(): Promise<void> {
+  const token = process.env.GITHUB_TOKEN;
+  
+  console.log("Fetching bounties from Opire...");
   const res = await fetch(ENDPOINT, {
-    headers: {
-      "user-agent": "opire-watcher (+https://github.com/yasumorishima/opire-watcher)",
-      accept: "application/json",
-    },
+    headers: { "user-agent": "opire-watcher" },
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const items = (await res.json()) as any[];
-
+  if (!res.ok) {
+    throw new Error(`Failed to fetch: ${res.status} ${res.statusText}`);
+  }
+  
+  const data = (await res.json()) as any;
+  const bounties: Bounty[] = data["hydra:member"] || [];
+  
+  console.log(`Found ${bounties.length} bounties`);
+  
+  // Add fetched_at timestamp and check issue states
   const now = new Date().toISOString();
-  const bounties: Bounty[] = items.map((b: any) => ({
-    id: b.id,
-    amount_usd: toUsd(b.pendingPrice),
-    title: b.title ?? null,
-    url: b.url ?? null,
-    platform: b.platform ?? "unknown",
-    org_name: b.organization?.name ?? null,
-    org_url: b.organization?.url ?? null,
-    project_name: b.project?.name ?? null,
-    project_url: b.project?.url ?? null,
-    project_repo_owner: extractRepoOwner(b.project?.url ?? b.url ?? null),
-    programming_languages: Array.isArray(b.programmingLanguages) ? b.programmingLanguages : [],
-    claimer_usernames: Array.isArray(b.claimerUsers)
-      ? b.claimerUsers.map((u: User) => u.username)
-      : [],
-    trying_usernames: Array.isArray(b.tryingUsers)
-      ? b.tryingUsers.map((u: User) => u.username)
-      : [],
-    created_at: toIso(b.createdAt),
-    fetched_at: now,
-  }));
-
-  const outPath = resolve("data/bounties.json");
-  const prev: Bounty[] = existsSync(outPath)
-    ? JSON.parse(readFileSync(outPath, "utf-8"))
-    : [];
-  const prevIds = new Set(prev.map((b) => b.id));
-  const newOnes = bounties.filter((b) => !prevIds.has(b.id));
-
-  const ghToken = process.env.GITHUB_TOKEN;
-  for (const b of bounties) {
-    const info = await checkIssue(b.url, ghToken);
-    if (info) {
-      b.issue_state = info.state;
-      b.issue_github_assignees = info.assignees;
-      b.availability_checked_at = now;
+  for (const bounty of bounties) {
+    bounty.fetched_at = now;
+    
+    // Check GitHub issue state if it's a GitHub URL
+    const issueInfo = await checkIssue(bounty.url, token);
+    if (issueInfo) {
+      bounty.issue_state = issueInfo.state;
+      bounty.issue_github_assignees = issueInfo.assignees;
+      bounty.availability_checked_at = now;
     }
   }
-  const prevById = new Map(prev.map((b) => [b.id, b]));
-  for (const b of bounties) {
-    if (b.issue_state === undefined) {
-      const p = prevById.get(b.id);
-      if (p?.issue_state !== undefined) {
-        b.issue_state = p.issue_state;
-        b.issue_github_assignees = p.issue_github_assignees;
-        b.availability_checked_at = p.availability_checked_at;
-      }
+  
+  const dataDir = resolve(process.cwd(), "data");
+  const bountiesFile = resolve(dataDir, "bounties.json");
+  const newBountiesFile = resolve(dataDir, "new-bounties.json");
+  
+  // Load existing bounties to find new ones
+  let existingBounties: Bounty[] = [];
+  if (existsSync(bountiesFile)) {
+    try {
+      existingBounties = JSON.parse(readFileSync(bountiesFile, "utf8"));
+    } catch {
+      console.warn("Could not parse existing bounties.json");
     }
   }
-
-  const merged = [
-    ...bounties,
-    ...prev.filter((b) => !bounties.some((c) => c.id === b.id)),
-  ].sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
-
-  writeFileSync(outPath, JSON.stringify(merged, null, 2) + "\n");
-  writeFileSync(
-    resolve("data/new-bounties.json"),
-    JSON.stringify(newOnes, null, 2) + "\n",
-  );
-
-  console.log(`fetched=${bounties.length} new=${newOnes.length} total=${merged.length}`);
+  
+  const existingIds = new Set(existingBounties.map(b => b.id));
+  const newBounties = bounties.filter(b => !existingIds.has(b.id));
+  
+  console.log(`New bounties: ${newBounties.length}`);
+  
+  // Save all bounties
+  writeFileSync(bountiesFile, JSON.stringify(bounties, null, 2));
+  
+  // Save new bounties for notification
+  writeFileSync(newBountiesFile, JSON.stringify(newBounties, null, 2));
+  
+  console.log(`Saved ${bounties.length} bounties to ${bountiesFile}`);
+  console.log(`Saved ${newBounties.length} new bounties to ${newBountiesFile}`);
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("Error:", err);
+    process.exit(1);
+  });
+}
